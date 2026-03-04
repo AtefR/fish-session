@@ -21,6 +21,25 @@ fisher install AtefR/fish-session
 
 Then install the required binaries (`fish-session` and `fish-sessiond`).
 
+### Arch Linux (`paru` / AUR)
+
+After the AUR package is published, install with:
+
+```bash
+paru -S fish-session
+# or latest git:
+paru -S fish-session-git
+```
+
+The Arch package installs both binaries and Fish integration files, so Fisher is not required on that path.
+
+If you want to test locally before AUR publish:
+
+```bash
+cd packaging/aur/fish-session
+makepkg -si
+```
+
 Option A (recommended binary install, from GitHub):
 
 ```bash
