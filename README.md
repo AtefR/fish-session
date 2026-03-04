@@ -13,11 +13,15 @@ UI-first session manager for Fish shell with persistent PTY sessions, fast reatt
 
 ## Installation
 
-### 1) Install binaries
+### Recommended: install with Fisher
 
-You need both binaries: `fish-session` and `fish-sessiond`.
+```fish
+fisher install AtefR/fish-session
+```
 
-Option A (recommended, from GitHub):
+Then install the required binaries (`fish-session` and `fish-sessiond`).
+
+Option A (recommended binary install, from GitHub):
 
 ```bash
 cargo install --git https://github.com/AtefR/fish-session.git
@@ -32,12 +36,6 @@ install -Dm755 target/release/fish-sessiond ~/.local/bin/fish-sessiond
 ```
 
 Make sure `~/.local/bin` is in your `PATH`.
-
-### 2) Install Fish plugin files with Fisher
-
-```fish
-fisher install AtefR/fish-session
-```
 
 ## Quick Start
 
