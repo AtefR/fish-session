@@ -13,57 +13,39 @@ UI-first session manager for Fish shell with persistent PTY sessions, fast reatt
 
 ## Installation
 
-### Recommended: install with Fisher
+Choose one installation path.
+
+### Arch Linux (AUR)
+
+```bash
+paru -S fish-session
+# or latest git version:
+paru -S fish-session-git
+```
+
+This installs both binaries and Fish integration files. Fisher is not required on this path.
+
+### Other systems (Fisher + Cargo)
+
+1) Install Fish integration with Fisher:
 
 ```fish
 fisher install AtefR/fish-session
 ```
 
-Then install the required binaries (`fish-session` and `fish-sessiond`).
-
-### Arch Linux (`paru` / AUR)
-
-After the AUR package is published, install with:
-
-```bash
-paru -S fish-session
-# or latest git:
-paru -S fish-session-git
-```
-
-The Arch package installs both binaries and Fish integration files, so Fisher is not required on that path.
-
-If you want to test locally before AUR publish:
-
-```bash
-cd packaging/aur/fish-session
-makepkg -si
-```
-
-Option A (recommended binary install, from GitHub):
+2) Install binaries:
 
 ```bash
 cargo install --git https://github.com/AtefR/fish-session.git
 ```
 
-By default, `cargo install` puts binaries in `~/.cargo/bin`.
-Add it to Fish PATH explicitly:
+3) Ensure Cargo bin is in Fish `PATH`:
 
 ```fish
 fish_add_path ~/.cargo/bin
 ```
 
-Restart Fish (or open a new shell) after updating PATH.
-
-Option B (local clone):
-
-```bash
-cargo build --release
-install -Dm755 target/release/fish-session ~/.local/bin/fish-session
-install -Dm755 target/release/fish-sessiond ~/.local/bin/fish-sessiond
-```
-
-Make sure `~/.local/bin` is in your `PATH`.
+4) Open a new Fish shell.
 
 ## Quick Start
 
@@ -74,16 +56,16 @@ Make sure `~/.local/bin` is in your `PATH`.
 
 ## Keybindings
 
-### Picker (Sessions)
+### Session Picker
 
 - `Enter`: attach selected session
 - `Ctrl-N`: create session
 - `Ctrl-D`: delete selected session
 - `Ctrl-R`: rename selected session
 - `Ctrl-O`: open zoxide mode
-- `Esc`: close picker (or clear search first when search is not empty)
+- `Esc`: close picker (or clear search when search is not empty)
 
-### Picker (Zoxide)
+### Zoxide Picker
 
 - Type to filter
 - `Enter`: create/attach session for selected directory
@@ -128,18 +110,17 @@ Disable default `Ctrl-G` binding:
 set -g fish_session_disable_default_bind 1
 ```
 
-## Development
+## Troubleshooting
 
-```bash
-cargo fmt
-cargo clippy --all-targets --all-features
-cargo test
+If you see `fish_session: fish-session binary not found in PATH`:
+
+```fish
+fish_add_path ~/.cargo/bin
 ```
 
-## Architecture
+Then open a new shell and verify:
 
-- `fish-sessiond`: daemon, socket RPC, PTY session lifecycle
-- `fish-session`: UI + attach client
-- Fish integration files are in:
-  - `functions/fish_session.fish`
-  - `conf.d/fish-session.fish`
+```fish
+command -v fish-session
+command -v fish-sessiond
+```
