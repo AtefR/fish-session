@@ -47,6 +47,34 @@ fish_add_path ~/.cargo/bin
 
 4) Open a new Fish shell.
 
+### Other systems (Fisher + GitHub release binaries)
+
+1) Install Fish integration with Fisher:
+
+```fish
+fisher install AtefR/fish-session
+```
+
+2) Download binaries from the latest release assets:
+
+```bash
+VERSION=v0.1.0
+curl -fL -o fish-session "https://github.com/AtefR/fish-session/releases/download/${VERSION}/fish-session"
+curl -fL -o fish-sessiond "https://github.com/AtefR/fish-session/releases/download/${VERSION}/fish-sessiond"
+install -Dm755 fish-session ~/.local/bin/fish-session
+install -Dm755 fish-sessiond ~/.local/bin/fish-sessiond
+```
+
+3) Ensure local bin is in Fish `PATH`:
+
+```fish
+fish_add_path ~/.local/bin
+```
+
+4) Open a new Fish shell.
+
+If release assets are not available yet, use the AUR or Cargo installation path.
+
 ## Quick Start
 
 1. Open picker: `Ctrl-G`
