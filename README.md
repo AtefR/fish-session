@@ -28,11 +28,13 @@ cargo install --git https://github.com/AtefR/fish-session.git
 ```
 
 By default, `cargo install` puts binaries in `~/.cargo/bin`.
-The plugin now auto-detects that location, but adding it to your Fish PATH is still recommended:
+Add it to Fish PATH explicitly:
 
 ```fish
 fish_add_path ~/.cargo/bin
 ```
+
+Restart Fish (or open a new shell) after updating PATH.
 
 Option B (local clone):
 
