@@ -27,6 +27,13 @@ Option A (recommended binary install, from GitHub):
 cargo install --git https://github.com/AtefR/fish-session.git
 ```
 
+By default, `cargo install` puts binaries in `~/.cargo/bin`.
+The plugin now auto-detects that location, but adding it to your Fish PATH is still recommended:
+
+```fish
+fish_add_path ~/.cargo/bin
+```
+
 Option B (local clone):
 
 ```bash
