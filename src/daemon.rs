@@ -31,6 +31,7 @@ struct Session {
     attached: bool,
     attach_id: u64,
     scrollback: VecDeque<u8>,
+    alt_scrollback: VecDeque<u8>,
     capture_tail: Vec<u8>,
     alt_screen_active: bool,
 }
@@ -190,6 +191,7 @@ fn create_session(
             attached: false,
             attach_id: 0,
             scrollback: VecDeque::new(),
+            alt_scrollback: VecDeque::new(),
             capture_tail: Vec::new(),
             alt_screen_active: false,
         },
@@ -245,7 +247,7 @@ fn attach_session(
     cols: Option<u16>,
     replay_requested: bool,
 ) -> Result<()> {
-    let (pty_fd, attach_id, replay) = {
+    let (pty_fd, attach_id, replay, preserve_alt_screen) = {
         let mut lock = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
         reap_dead_sessions(&mut lock);
 
@@ -261,17 +263,13 @@ fn attach_session(
             let _ = set_winsize(session.master.as_raw_fd(), rows, cols);
         }
         let pty_fd = dup_owned_fd(session.master.as_raw_fd())?;
-        let replay = if replay_requested {
-            session.scrollback.iter().copied().collect()
-        } else {
-            Vec::new()
-        };
-        (pty_fd, attach_id, replay)
+        let (replay, preserve_alt_screen) = replay_payload(session, replay_requested);
+        (pty_fd, attach_id, replay, preserve_alt_screen)
     };
 
     write_response(&mut stream, &Response::ok())?;
     if !replay.is_empty() {
-        let replay = filter_replay_bytes(&replay);
+        let replay = filter_replay_bytes(&replay, preserve_alt_screen);
         stream.write_all(&replay)?;
     }
     stream.flush()?;
@@ -286,6 +284,18 @@ fn attach_session(
     }
 
     Ok(())
+}
+
+fn replay_payload(session: &Session, replay_requested: bool) -> (Vec<u8>, bool) {
+    if !replay_requested {
+        return (Vec::new(), false);
+    }
+
+    if session.alt_screen_active {
+        return (session.alt_scrollback.iter().copied().collect(), true);
+    }
+
+    (session.scrollback.iter().copied().collect(), false)
 }
 
 fn set_winsize(fd: i32, rows: u16, cols: u16) -> Result<()> {
@@ -391,21 +401,7 @@ fn append_scrollback(state: &Arc<Mutex<DaemonState>>, name: &str, bytes: &[u8]) 
         return Ok(());
     }
 
-    if captured.len() >= SCROLLBACK_MAX_BYTES {
-        session.scrollback.clear();
-        session.scrollback.extend(
-            captured[captured.len() - SCROLLBACK_MAX_BYTES..]
-                .iter()
-                .copied(),
-        );
-        return Ok(());
-    }
-
-    while session.scrollback.len() + captured.len() > SCROLLBACK_MAX_BYTES {
-        session.scrollback.pop_front();
-    }
-
-    session.scrollback.extend(captured);
+    append_bounded(&mut session.scrollback, &captured, SCROLLBACK_MAX_BYTES);
     Ok(())
 }
 
@@ -423,7 +419,13 @@ fn capture_scrollback_bytes(session: &mut Session, bytes: &[u8]) -> Vec<u8> {
     while i < input.len() {
         let byte = input[i];
         if byte != 0x1b {
-            if !session.alt_screen_active {
+            if session.alt_screen_active {
+                append_bounded(
+                    &mut session.alt_scrollback,
+                    &input[i..i + 1],
+                    SCROLLBACK_MAX_BYTES,
+                );
+            } else {
                 out.push(byte);
             }
             i += 1;
@@ -438,13 +440,34 @@ fn capture_scrollback_bytes(session: &mut Session, bytes: &[u8]) -> Vec<u8> {
         match input[i + 1] {
             b'[' => {
                 if let Some((end, params, final_byte)) = parse_csi(&input, i) {
+                    let sequence = &input[i..end];
+                    let was_alt_active = session.alt_screen_active;
                     let touched_alt = apply_alt_screen_private_mode(
                         params,
                         final_byte,
                         &mut session.alt_screen_active,
                     );
-                    if !session.alt_screen_active && !touched_alt {
-                        out.extend_from_slice(&input[i..end]);
+                    if touched_alt {
+                        if !was_alt_active && session.alt_screen_active {
+                            session.alt_scrollback.clear();
+                            append_bounded(
+                                &mut session.alt_scrollback,
+                                sequence,
+                                SCROLLBACK_MAX_BYTES,
+                            );
+                        } else if was_alt_active && !session.alt_screen_active {
+                            session.alt_scrollback.clear();
+                        } else if session.alt_screen_active {
+                            append_bounded(
+                                &mut session.alt_scrollback,
+                                sequence,
+                                SCROLLBACK_MAX_BYTES,
+                            );
+                        }
+                    } else if session.alt_screen_active {
+                        append_bounded(&mut session.alt_scrollback, sequence, SCROLLBACK_MAX_BYTES);
+                    } else {
+                        out.extend_from_slice(sequence);
                     }
                     i = end;
                     continue;
@@ -454,8 +477,11 @@ fn capture_scrollback_bytes(session: &mut Session, bytes: &[u8]) -> Vec<u8> {
             }
             b']' => {
                 if let Some((end, _payload)) = parse_osc(&input, i) {
-                    if !session.alt_screen_active {
-                        out.extend_from_slice(&input[i..end]);
+                    let sequence = &input[i..end];
+                    if session.alt_screen_active {
+                        append_bounded(&mut session.alt_scrollback, sequence, SCROLLBACK_MAX_BYTES);
+                    } else {
+                        out.extend_from_slice(sequence);
                     }
                     i = end;
                     continue;
@@ -465,8 +491,11 @@ fn capture_scrollback_bytes(session: &mut Session, bytes: &[u8]) -> Vec<u8> {
             }
             b'_' => {
                 if let Some((end, _payload)) = parse_apc(&input, i) {
-                    if !session.alt_screen_active {
-                        out.extend_from_slice(&input[i..end]);
+                    let sequence = &input[i..end];
+                    if session.alt_screen_active {
+                        append_bounded(&mut session.alt_scrollback, sequence, SCROLLBACK_MAX_BYTES);
+                    } else {
+                        out.extend_from_slice(sequence);
                     }
                     i = end;
                     continue;
@@ -475,7 +504,13 @@ fn capture_scrollback_bytes(session: &mut Session, bytes: &[u8]) -> Vec<u8> {
                 break;
             }
             _ => {
-                if !session.alt_screen_active {
+                if session.alt_screen_active {
+                    append_bounded(
+                        &mut session.alt_scrollback,
+                        &input[i..i + 2],
+                        SCROLLBACK_MAX_BYTES,
+                    );
+                } else {
                     out.push(input[i]);
                     out.push(input[i + 1]);
                 }
@@ -492,7 +527,24 @@ fn capture_scrollback_bytes(session: &mut Session, bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-fn filter_replay_bytes(input: &[u8]) -> Vec<u8> {
+fn append_bounded(buffer: &mut VecDeque<u8>, bytes: &[u8], max_bytes: usize) {
+    if bytes.is_empty() {
+        return;
+    }
+
+    if bytes.len() >= max_bytes {
+        buffer.clear();
+        buffer.extend(bytes[bytes.len() - max_bytes..].iter().copied());
+        return;
+    }
+
+    while buffer.len() + bytes.len() > max_bytes {
+        buffer.pop_front();
+    }
+    buffer.extend(bytes.iter().copied());
+}
+
+fn filter_replay_bytes(input: &[u8], preserve_alt_screen: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0usize;
 
@@ -520,7 +572,13 @@ fn filter_replay_bytes(input: &[u8]) -> Vec<u8> {
             }
             b'[' => {
                 if let Some((end, params, final_byte)) = parse_csi(input, i) {
-                    if let Some(rewritten) = rewrite_replay_private_mode_csi(params, final_byte) {
+                    if preserve_alt_screen {
+                        if !is_terminal_query_csi(params, final_byte) {
+                            out.extend_from_slice(&input[i..end]);
+                        }
+                    } else if let Some(rewritten) =
+                        rewrite_replay_private_mode_csi(params, final_byte)
+                    {
                         out.extend_from_slice(&rewritten);
                     } else if !is_terminal_query_csi(params, final_byte) {
                         out.extend_from_slice(&input[i..end]);
@@ -936,6 +994,7 @@ fn reap_dead_sessions(state: &mut DaemonState) {
 mod tests {
     use super::{
         Session, apply_alt_screen_private_mode, capture_scrollback_bytes, filter_replay_bytes,
+        replay_payload,
     };
     use nix::pty::openpty;
     use std::collections::VecDeque;
@@ -951,6 +1010,7 @@ mod tests {
             attached: false,
             attach_id: 0,
             scrollback: VecDeque::new(),
+            alt_scrollback: VecDeque::new(),
             capture_tail: Vec::new(),
             alt_screen_active: false,
         }
@@ -959,7 +1019,7 @@ mod tests {
     #[test]
     fn replay_strips_alt_screen_sequences() {
         let input = b"pre\x1b[?1049hmid\x1b[?1049lpost";
-        let output = filter_replay_bytes(input);
+        let output = filter_replay_bytes(input, false);
         let text = String::from_utf8_lossy(&output);
         assert_eq!(text, "premidpost");
     }
@@ -967,14 +1027,14 @@ mod tests {
     #[test]
     fn replay_rewrites_mixed_private_modes() {
         let input = b"\x1b[?1049;25h";
-        let output = filter_replay_bytes(input);
+        let output = filter_replay_bytes(input, false);
         assert_eq!(output, b"\x1b[?25h");
     }
 
     #[test]
     fn replay_drops_alt_scroll_enable() {
         let input = b"A\x1b[?1007hB";
-        let output = filter_replay_bytes(input);
+        let output = filter_replay_bytes(input, false);
         assert_eq!(output, b"AB");
     }
 
@@ -1009,5 +1069,26 @@ mod tests {
         let touched = apply_alt_screen_private_mode(b"?25", b'h', &mut alt_active);
         assert!(!touched);
         assert!(!alt_active);
+    }
+
+    #[test]
+    fn capture_keeps_alt_scrollback_while_alt_screen_is_active() {
+        let mut session = test_session();
+        let _ = capture_scrollback_bytes(&mut session, b"\x1b[?1049hALT");
+        assert!(session.alt_screen_active);
+        let captured: Vec<u8> = session.alt_scrollback.iter().copied().collect();
+        assert_eq!(captured, b"\x1b[?1049hALT");
+    }
+
+    #[test]
+    fn replay_payload_prefers_alt_scrollback_when_active() {
+        let mut session = test_session();
+        session.scrollback.extend(b"PRIMARY".iter().copied());
+        session.alt_scrollback.extend(b"ALT".iter().copied());
+        session.alt_screen_active = true;
+
+        let (payload, preserve_alt_screen) = replay_payload(&session, true);
+        assert_eq!(payload, b"ALT");
+        assert!(preserve_alt_screen);
     }
 }

@@ -323,10 +323,11 @@ fn bridge_io(
         let mut output = stdout.lock();
         renderer.render(&mut output)?;
     }
-    // Drop any pending keypress (notably Enter from picker selection)
-    // before forwarding stdin into the attached session.
-    unsafe {
-        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    if swallow_initial_enter {
+        // Only flush stdin on attach flows that may carry picker Enter.
+        unsafe {
+            libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+        }
     }
 
     let mut read_stream = stream.try_clone()?;
@@ -334,6 +335,8 @@ fn bridge_io(
     let shutdown_stream = read_stream.try_clone()?;
     let switch_requested = Arc::new(AtomicBool::new(false));
     let switch_requested_for_input = Arc::clone(&switch_requested);
+    let alt_passthrough_active = Arc::new(AtomicBool::new(false));
+    let alt_passthrough_active_for_input = Arc::clone(&alt_passthrough_active);
     let mut input_filter = TerminalReplyFilter::default();
     let swallow_initial_enter_for_input = swallow_initial_enter;
 
@@ -351,7 +354,10 @@ fn bridge_io(
                 break;
             }
 
-            let mut filtered = input_filter.filter(&buf[..count]);
+            let mut filtered = input_filter.filter(
+                &buf[..count],
+                alt_passthrough_active_for_input.load(Ordering::Relaxed),
+            );
             if swallow_initial_enter {
                 if Instant::now() > swallow_deadline {
                     swallow_initial_enter = false;
@@ -402,12 +408,15 @@ fn bridge_io(
             Err(err) => return Err(err.into()),
         };
 
-        let queries = query_forwarder.extract_queries(&buf[..count]);
-        if !queries.is_empty() {
-            output.write_all(&queries)?;
-            output.flush()?;
+        if !renderer.is_alt_passthrough_active() {
+            let queries = query_forwarder.extract_queries(&buf[..count]);
+            if !queries.is_empty() {
+                output.write_all(&queries)?;
+                output.flush()?;
+            }
         }
         renderer.process_output(&buf[..count], &mut output)?;
+        alt_passthrough_active.store(renderer.is_alt_passthrough_active(), Ordering::Relaxed);
     }
 
     match input_thread.join() {
@@ -618,6 +627,8 @@ struct SessionRenderer {
     cols: u16,
     rows: u16,
     content_rows: u16,
+    alt_passthrough_active: bool,
+    mode_carry: Vec<u8>,
 }
 
 impl SessionRenderer {
@@ -630,13 +641,77 @@ impl SessionRenderer {
             cols,
             rows,
             content_rows,
+            alt_passthrough_active: false,
+            mode_carry: Vec::new(),
         })
     }
 
     fn process_output(&mut self, bytes: &[u8], output: &mut impl Write) -> Result<()> {
         self.refresh_layout_if_needed();
-        self.parser.process(bytes);
-        self.render(output)
+        let mut data = Vec::with_capacity(self.mode_carry.len() + bytes.len());
+        data.extend_from_slice(&self.mode_carry);
+        data.extend_from_slice(bytes);
+        self.mode_carry.clear();
+
+        let mut primary_bytes = Vec::with_capacity(data.len());
+        let mut needs_render = false;
+        let mut wrote_raw = false;
+        let mut alt_state_changed = false;
+        let mut i = 0usize;
+        while i < data.len() {
+            if data[i] == 0x1b {
+                if i + 1 >= data.len() {
+                    self.mode_carry.extend_from_slice(&data[i..]);
+                    break;
+                }
+
+                if data[i + 1] == b'[' {
+                    if let Some((end, params, final_byte)) = parse_csi_at(&data, i) {
+                        if let Some(enter_alt) = parse_alt_screen_transition(params, final_byte) {
+                            if enter_alt {
+                                self.alt_passthrough_active = true;
+                                alt_state_changed = true;
+                            } else {
+                                self.alt_passthrough_active = false;
+                                self.composed_screen = None;
+                                needs_render = true;
+                                alt_state_changed = true;
+                            }
+                            i = end;
+                            continue;
+                        }
+                    } else {
+                        self.mode_carry.extend_from_slice(&data[i..]);
+                        break;
+                    }
+                }
+            }
+
+            if self.alt_passthrough_active {
+                output.write_all(&data[i..i + 1])?;
+                wrote_raw = true;
+            } else {
+                primary_bytes.push(data[i]);
+            }
+            i += 1;
+        }
+
+        if !primary_bytes.is_empty() {
+            self.parser.process(&primary_bytes);
+            needs_render = true;
+        }
+
+        if needs_render && !self.alt_passthrough_active {
+            self.render(output)?;
+        } else if wrote_raw {
+            output.flush()?;
+        }
+
+        if self.alt_passthrough_active && (wrote_raw || alt_state_changed) {
+            self.render_status_overlay(output)?;
+        }
+
+        Ok(())
     }
 
     fn render(&mut self, output: &mut impl Write) -> Result<()> {
@@ -674,6 +749,25 @@ impl SessionRenderer {
         self.composed_screen = None;
     }
 
+    fn is_alt_passthrough_active(&self) -> bool {
+        self.alt_passthrough_active
+    }
+
+    fn render_status_overlay(&self, output: &mut impl Write) -> Result<()> {
+        if self.rows == 0 {
+            return Ok(());
+        }
+
+        let label = status_label(&self.session_name, self.cols);
+        write!(
+            output,
+            "\x1b7\x1b[{};1H\x1b[2K\x1b[7m{}\x1b[m\x1b8",
+            self.rows, label
+        )?;
+        output.flush()?;
+        Ok(())
+    }
+
     fn compose_frame(&self, include_status: bool) -> Vec<u8> {
         let mut frame = Vec::new();
 
@@ -694,6 +788,37 @@ impl SessionRenderer {
         frame.extend_from_slice(&self.parser.screen().attributes_formatted());
         frame
     }
+}
+
+fn parse_csi_at(input: &[u8], start: usize) -> Option<(usize, &[u8], u8)> {
+    if start + 2 >= input.len() || input[start] != 0x1b || input[start + 1] != b'[' {
+        return None;
+    }
+
+    let mut i = start + 2;
+    while i < input.len() {
+        let byte = input[i];
+        if (0x40..=0x7e).contains(&byte) {
+            return Some((i + 1, &input[start + 2..i], byte));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_alt_screen_transition(params: &[u8], final_byte: u8) -> Option<bool> {
+    if (final_byte != b'h' && final_byte != b'l') || !params.starts_with(b"?") {
+        return None;
+    }
+
+    let has_alt_mode = params[1..]
+        .split(|byte| *byte == b';')
+        .any(|mode| mode == b"47" || mode == b"1047" || mode == b"1049");
+    if !has_alt_mode {
+        return None;
+    }
+
+    Some(final_byte == b'h')
 }
 
 fn current_terminal_layout() -> (u16, u16, u16) {
@@ -841,7 +966,15 @@ struct TerminalReplyFilter {
 }
 
 impl TerminalReplyFilter {
-    fn filter(&mut self, chunk: &[u8]) -> Vec<u8> {
+    fn filter(&mut self, chunk: &[u8], passthrough_mode: bool) -> Vec<u8> {
+        if passthrough_mode {
+            let mut out = Vec::with_capacity(self.carry.len() + chunk.len());
+            out.extend_from_slice(&self.carry);
+            self.carry.clear();
+            out.extend_from_slice(chunk);
+            return out;
+        }
+
         let mut data = Vec::with_capacity(self.carry.len() + chunk.len());
         data.extend_from_slice(&self.carry);
         data.extend_from_slice(chunk);
