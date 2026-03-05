@@ -198,13 +198,7 @@ pub fn attach_session_with_replay(name: &str, replay: bool) -> Result<()> {
 
         match bridge_io(stream, &current, should_clear_before_attach, !should_replay)? {
             BridgeOutcome::Detached => return Ok(()),
-            BridgeOutcome::SwitchRequested { snapshot } => {
-                if !snapshot.is_empty() {
-                    let stdout = io::stdout();
-                    let mut output = stdout.lock();
-                    output.write_all(&snapshot)?;
-                    output.flush()?;
-                }
+            BridgeOutcome::SwitchRequested => {
                 if let Some(next) = crate::ui::pick_session_with_active(Some(&current))? {
                     if next.name == current {
                         // Re-select current session: reconnect with replay to restore the surface.
@@ -300,7 +294,7 @@ fn read_line_direct(stream: &mut UnixStream) -> Result<String> {
 
 enum BridgeOutcome {
     Detached,
-    SwitchRequested { snapshot: Vec<u8> },
+    SwitchRequested,
 }
 
 fn bridge_io(
@@ -413,9 +407,7 @@ fn bridge_io(
     };
 
     if switch_requested.load(Ordering::Relaxed) {
-        Ok(BridgeOutcome::SwitchRequested {
-            snapshot: renderer.snapshot(),
-        })
+        Ok(BridgeOutcome::SwitchRequested)
     } else {
         Ok(BridgeOutcome::Detached)
     }
@@ -624,11 +616,6 @@ impl SessionRenderer {
         frame
     }
 
-    fn snapshot(&self) -> Vec<u8> {
-        // Snapshot is rendered on the primary screen before opening picker.
-        // Do not include the status row there, or it can persist after detach.
-        self.compose_frame(false)
-    }
 }
 
 fn current_terminal_layout() -> (u16, u16, u16) {
