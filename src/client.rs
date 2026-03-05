@@ -172,13 +172,14 @@ pub fn attach_session_with_replay(name: &str, replay: bool) -> Result<()> {
     let mut should_replay = replay;
 
     loop {
+        let (attach_cols, attach_rows) = attach_dimensions_for_status_line();
         let mut stream = connect_daemon().context("failed to connect to daemon")?;
         write_request(
             &mut stream,
             &Request::Attach {
                 name: current.clone(),
-                rows: terminal_size().ok().map(|(_, rows)| rows),
-                cols: terminal_size().ok().map(|(cols, _)| cols),
+                rows: attach_rows,
+                cols: attach_cols,
                 replay: Some(should_replay),
             },
         )?;
@@ -197,7 +198,13 @@ pub fn attach_session_with_replay(name: &str, replay: bool) -> Result<()> {
 
         match bridge_io(stream, &current, should_clear_before_attach, !should_replay)? {
             BridgeOutcome::Detached => return Ok(()),
-            BridgeOutcome::SwitchRequested => {
+            BridgeOutcome::SwitchRequested { snapshot } => {
+                if !snapshot.is_empty() {
+                    let stdout = io::stdout();
+                    let mut output = stdout.lock();
+                    output.write_all(&snapshot)?;
+                    output.flush()?;
+                }
                 if let Some(next) = crate::ui::pick_session_with_active(Some(&current))? {
                     if next.name == current {
                         // Re-select current session: reconnect with replay to restore the surface.
@@ -216,6 +223,22 @@ pub fn attach_session_with_replay(name: &str, replay: bool) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+fn attach_dimensions_for_status_line() -> (Option<u16>, Option<u16>) {
+    match terminal_size() {
+        Ok((cols, rows)) => {
+            let safe_cols = cols.max(1);
+            let safe_rows = rows.max(1);
+            let session_rows = if safe_rows > 1 {
+                safe_rows - 1
+            } else {
+                safe_rows
+            };
+            (Some(safe_cols), Some(session_rows))
+        }
+        Err(_) => (None, None),
     }
 }
 
@@ -277,7 +300,7 @@ fn read_line_direct(stream: &mut UnixStream) -> Result<String> {
 
 enum BridgeOutcome {
     Detached,
-    SwitchRequested,
+    SwitchRequested { snapshot: Vec<u8> },
 }
 
 fn bridge_io(
@@ -290,7 +313,13 @@ fn bridge_io(
     let _screen_restore_guard =
         ScreenRestoreGuard::new(clear_screen_on_attach, swallow_initial_enter)?;
     disable_alternate_scroll_if_needed()?;
-    let mut status_line = StatusLineGuard::install(session_name)?;
+    let mut renderer = SessionRenderer::new(session_name)?;
+    // Paint initial empty frame/status immediately after entering alt-screen.
+    {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        renderer.render(&mut output)?;
+    }
     // Drop any pending keypress (notably Enter from picker selection)
     // before forwarding stdin into the attached session.
     unsafe {
@@ -360,7 +389,7 @@ fn bridge_io(
     let stdout = io::stdout();
     let mut output = stdout.lock();
     let mut buf = [0_u8; 4096];
-    let mut output_filter = OutputFilter::default();
+    let mut query_forwarder = TerminalQueryForwarder::default();
     loop {
         let count = match read_stream.read(&mut buf) {
             Ok(0) => break,
@@ -370,24 +399,12 @@ fn bridge_io(
             Err(err) => return Err(err.into()),
         };
 
-        let filtered = output_filter.filter(&buf[..count]);
-        if !filtered.is_empty() {
-            output.write_all(&filtered)?;
+        let queries = query_forwarder.extract_queries(&buf[..count]);
+        if !queries.is_empty() {
+            output.write_all(&queries)?;
+            output.flush()?;
         }
-        output.flush()?;
-        status_line.redraw()?;
-    }
-    let pending = output_filter.finish();
-    if !pending.is_empty() {
-        output.write_all(&pending)?;
-        output.flush()?;
-    }
-    let nested_alt_depth = output_filter.take_alt_screen_depth();
-    if nested_alt_depth > 0 {
-        for _ in 0..nested_alt_depth {
-            write!(output, "\x1b[?1049l")?;
-        }
-        output.flush()?;
+        renderer.process_output(&buf[..count], &mut output)?;
     }
 
     match input_thread.join() {
@@ -396,7 +413,9 @@ fn bridge_io(
     };
 
     if switch_requested.load(Ordering::Relaxed) {
-        Ok(BridgeOutcome::SwitchRequested)
+        Ok(BridgeOutcome::SwitchRequested {
+            snapshot: renderer.snapshot(),
+        })
     } else {
         Ok(BridgeOutcome::Detached)
     }
@@ -521,25 +540,135 @@ fn parse_csi_u_control(bytes: &[u8]) -> Option<(usize, bool)> {
     Some((i + 1, is_switch))
 }
 
-#[derive(Default)]
-struct OutputFilter {
-    carry: Vec<u8>,
-    alt_screen_depth: usize,
+struct SessionRenderer {
+    session_name: String,
+    parser: vt100::Parser,
+    composed_screen: Option<vt100::Screen>,
+    cols: u16,
+    rows: u16,
+    content_rows: u16,
 }
 
-impl OutputFilter {
-    fn filter(&mut self, chunk: &[u8]) -> Vec<u8> {
+impl SessionRenderer {
+    fn new(session_name: &str) -> Result<Self> {
+        let (cols, rows, content_rows) = current_terminal_layout();
+        Ok(Self {
+            session_name: session_name.to_string(),
+            parser: vt100::Parser::new(content_rows.max(1), cols.max(1), 8_192),
+            composed_screen: None,
+            cols,
+            rows,
+            content_rows,
+        })
+    }
+
+    fn process_output(&mut self, bytes: &[u8], output: &mut impl Write) -> Result<()> {
+        self.refresh_layout_if_needed();
+        self.parser.process(bytes);
+        self.render(output)
+    }
+
+    fn render(&mut self, output: &mut impl Write) -> Result<()> {
+        self.refresh_layout_if_needed();
+
+        let frame = self.compose_frame();
+        let mut next = vt100::Parser::new(self.rows.max(1), self.cols.max(1), 0);
+        next.process(&frame);
+
+        let rendered = if let Some(prev) = &self.composed_screen {
+            next.screen().state_diff(prev)
+        } else {
+            next.screen().state_formatted()
+        };
+
+        if !rendered.is_empty() {
+            output.write_all(&rendered)?;
+            output.flush()?;
+        }
+        self.composed_screen = Some(next.screen().clone());
+        Ok(())
+    }
+
+    fn refresh_layout_if_needed(&mut self) {
+        let (cols, rows, content_rows) = current_terminal_layout();
+        if cols == self.cols && rows == self.rows && content_rows == self.content_rows {
+            return;
+        }
+
+        self.cols = cols;
+        self.rows = rows;
+        self.content_rows = content_rows;
+        self.parser
+            .set_size(self.content_rows.max(1), self.cols.max(1));
+        self.composed_screen = None;
+    }
+
+    fn compose_frame(&self) -> Vec<u8> {
+        let mut frame = Vec::new();
+
+        // Build a deterministic frame: clear, draw session viewport, draw status.
+        frame.extend_from_slice(b"\x1b[?25h\x1b[m\x1b[H\x1b[2J");
+        frame.extend_from_slice(b"\x1b[1;1H");
+        frame.extend_from_slice(&self.parser.screen().contents_formatted());
+
+        if self.rows >= 2 {
+            frame.extend_from_slice(format!("\x1b[{};1H\x1b[2K", self.rows).as_bytes());
+            frame.extend_from_slice(b"\x1b[7m");
+            let label = status_label(&self.session_name, self.cols);
+            frame.extend_from_slice(label.as_bytes());
+            frame.extend_from_slice(b"\x1b[m");
+        }
+
+        frame.extend_from_slice(&self.parser.screen().cursor_state_formatted());
+        frame.extend_from_slice(&self.parser.screen().attributes_formatted());
+        frame
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.compose_frame()
+    }
+}
+
+fn current_terminal_layout() -> (u16, u16, u16) {
+    let (cols, rows) = terminal_size().unwrap_or((80, 24));
+    let safe_cols = cols.max(1);
+    let safe_rows = rows.max(1);
+    let content_rows = if safe_rows > 1 {
+        safe_rows - 1
+    } else {
+        safe_rows
+    };
+    (safe_cols, safe_rows, content_rows)
+}
+
+fn status_label(name: &str, cols: u16) -> String {
+    if cols == 0 {
+        return String::new();
+    }
+
+    let mut label = format!(" {name} ");
+    if label.chars().count() > cols as usize {
+        label = label.chars().take(cols as usize).collect();
+    }
+    label
+}
+
+#[derive(Default)]
+struct TerminalQueryForwarder {
+    carry: Vec<u8>,
+}
+
+impl TerminalQueryForwarder {
+    fn extract_queries(&mut self, chunk: &[u8]) -> Vec<u8> {
         let mut data = Vec::with_capacity(self.carry.len() + chunk.len());
         data.extend_from_slice(&self.carry);
         data.extend_from_slice(chunk);
         self.carry.clear();
 
-        let mut out = Vec::with_capacity(data.len());
+        let mut out = Vec::new();
         let mut i = 0usize;
-
         while i < data.len() {
             if data[i] != 0x1b {
-                out.push(data[i]);
                 i += 1;
                 continue;
             }
@@ -549,109 +678,94 @@ impl OutputFilter {
                 break;
             }
 
-            if data[i + 1] != b'[' {
-                out.push(data[i]);
-                i += 1;
-                continue;
-            }
+            match data[i + 1] {
+                b'[' => {
+                    let mut j = i + 2;
+                    while j < data.len() && !(0x40..=0x7e).contains(&data[j]) {
+                        j += 1;
+                    }
+                    if j >= data.len() {
+                        self.carry.extend_from_slice(&data[i..]);
+                        break;
+                    }
 
-            let mut j = i + 2;
-            while j < data.len() && !(0x40..=0x7e).contains(&data[j]) {
-                j += 1;
+                    let params = &data[i + 2..j];
+                    let final_byte = data[j];
+                    if is_terminal_query_csi(params, final_byte) {
+                        out.extend_from_slice(&data[i..=j]);
+                    }
+                    i = j + 1;
+                }
+                b']' => {
+                    if let Some(end) = osc_end(&data, i + 2) {
+                        if is_terminal_query_osc(&data[i..end]) {
+                            out.extend_from_slice(&data[i..end]);
+                        }
+                        i = end;
+                    } else {
+                        self.carry.extend_from_slice(&data[i..]);
+                        break;
+                    }
+                }
+                b'P' => {
+                    if let Some(end) = st_end(&data, i + 2) {
+                        if is_terminal_query_dcs(&data[i..end]) {
+                            out.extend_from_slice(&data[i..end]);
+                        }
+                        i = end;
+                    } else {
+                        self.carry.extend_from_slice(&data[i..]);
+                        break;
+                    }
+                }
+                b'Z' => {
+                    // DECID query (legacy primary DA)
+                    out.extend_from_slice(&data[i..=i + 1]);
+                    i += 2;
+                }
+                _ => {
+                    i += 1;
+                }
             }
-
-            if j >= data.len() {
-                self.carry.extend_from_slice(&data[i..]);
-                break;
-            }
-
-            let params = &data[i + 2..j];
-            let final_byte = data[j];
-            if let Some(rewrite) =
-                rewrite_private_mode_csi(params, final_byte, &mut self.alt_screen_depth)
-            {
-                out.extend_from_slice(&rewrite);
-                i = j + 1;
-                continue;
-            }
-
-            out.extend_from_slice(&data[i..=j]);
-            i = j + 1;
         }
 
         out
     }
-
-    fn finish(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.carry)
-    }
-
-    fn take_alt_screen_depth(&mut self) -> usize {
-        std::mem::take(&mut self.alt_screen_depth)
-    }
 }
 
-fn rewrite_private_mode_csi(
-    params: &[u8],
-    final_byte: u8,
-    alt_screen_depth: &mut usize,
-) -> Option<Vec<u8>> {
-    if final_byte != b'h' && final_byte != b'l' {
-        return None;
-    }
-    if !params.starts_with(b"?") {
-        return None;
+fn is_terminal_query_csi(params: &[u8], final_byte: u8) -> bool {
+    // Device attributes + device status reports are request/response exchanges.
+    if final_byte == b'c' || final_byte == b'n' {
+        return true;
     }
 
-    let mut removed_any = false;
-    let mut kept_modes: Vec<&[u8]> = Vec::new();
-
-    for mode in params[1..].split(|byte| *byte == b';') {
-        if mode.is_empty() {
-            continue;
-        }
-        if mode == b"1007" && final_byte == b'h' {
-            removed_any = true;
-            continue;
-        }
-        if is_alt_screen_mode(mode) {
-            if final_byte == b'h' {
-                *alt_screen_depth = alt_screen_depth.saturating_add(1);
-                kept_modes.push(mode);
-            } else if *alt_screen_depth > 0 {
-                *alt_screen_depth -= 1;
-                kept_modes.push(mode);
-            } else {
-                // Ignore unmatched alt-screen disable so it cannot pop the
-                // outer attach screen.
-                removed_any = true;
-            }
-            continue;
-        }
-        kept_modes.push(mode);
+    // XTWINOPS queries (CSI ... t) usually contain one of these request codes.
+    if final_byte == b't' {
+        return params
+            .split(|byte| *byte == b';')
+            .any(|code| matches!(code, b"11" | b"13" | b"14" | b"18" | b"19" | b"20"));
     }
 
-    if !removed_any {
-        return None;
-    }
-
-    let mut out = Vec::new();
-    if !kept_modes.is_empty() {
-        out.extend_from_slice(b"\x1b[?");
-        for (idx, mode) in kept_modes.iter().enumerate() {
-            if idx > 0 {
-                out.push(b';');
-            }
-            out.extend_from_slice(mode);
-        }
-        out.push(final_byte);
-    }
-
-    Some(out)
+    false
 }
 
-fn is_alt_screen_mode(mode: &[u8]) -> bool {
-    mode == b"47" || mode == b"1047" || mode == b"1049"
+fn is_terminal_query_dcs(sequence: &[u8]) -> bool {
+    if sequence.len() < 4 {
+        return false;
+    }
+
+    // Sequence includes introducer (ESC P) and ST terminator.
+    let body = &sequence[2..sequence.len().saturating_sub(2)];
+    body.starts_with(b"$q") || body.starts_with(b"+q")
+}
+
+fn is_terminal_query_osc(sequence: &[u8]) -> bool {
+    if sequence.len() < 4 {
+        return false;
+    }
+
+    // Most OSC queries are shaped like: OSC <code>;? ... BEL/ST
+    sequence.windows(2).any(|window| window == b";?")
 }
 
 #[derive(Default)]
@@ -733,87 +847,6 @@ fn st_end(data: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-struct StatusLineGuard {
-    session_name: String,
-    enabled: bool,
-}
-
-impl StatusLineGuard {
-    fn install(session_name: &str) -> Result<Self> {
-        let mut guard = Self {
-            session_name: session_name.to_string(),
-            enabled: false,
-        };
-
-        guard.enabled = guard.configure_scroll_region()?;
-        if guard.enabled {
-            guard.redraw()?;
-        }
-
-        Ok(guard)
-    }
-
-    fn configure_scroll_region(&self) -> Result<bool> {
-        let (_, rows) = terminal_size().context("failed to get terminal size")?;
-        if rows < 2 {
-            return Ok(false);
-        }
-
-        let mut output = io::stdout().lock();
-        write!(output, "\x1b7\x1b[1;{}r\x1b8", rows - 1)?;
-        output.flush()?;
-        Ok(true)
-    }
-
-    fn redraw(&mut self) -> Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        let (cols, rows) = terminal_size().context("failed to get terminal size")?;
-        if rows < 2 || cols == 0 {
-            return Ok(());
-        }
-
-        let max_name = cols.saturating_sub(2) as usize;
-        let mut name = self.session_name.clone();
-        if name.chars().count() > max_name {
-            name = name.chars().take(max_name).collect();
-        }
-        let label = format!(" {name} ");
-
-        let mut output = io::stdout().lock();
-        write!(
-            output,
-            "\x1b7\x1b[{};1H\x1b[2K\x1b[7m{}\x1b[0m\x1b8",
-            rows, label
-        )?;
-        output.flush()?;
-        Ok(())
-    }
-}
-
-impl Drop for StatusLineGuard {
-    fn drop(&mut self) {
-        if !self.enabled {
-            return;
-        }
-
-        let rows = match terminal_size() {
-            Ok((_, rows)) => rows,
-            Err(_) => return,
-        };
-
-        if rows < 1 {
-            return;
-        }
-
-        let mut output = io::stdout().lock();
-        let _ = write!(output, "\x1b7\x1b[r\x1b[{};1H\x1b[2K\x1b8", rows);
-        let _ = output.flush();
-    }
-}
-
 struct RawModeGuard;
 
 impl RawModeGuard {
@@ -864,4 +897,33 @@ fn disable_alternate_scroll_if_needed() -> Result<()> {
     write!(output, "\x1b[?1007l")?;
     output.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TerminalQueryForwarder;
+
+    #[test]
+    fn forwards_primary_da_query() {
+        let mut forwarder = TerminalQueryForwarder::default();
+        let bytes = b"abc\x1b[cdef";
+        let queries = forwarder.extract_queries(bytes);
+        assert_eq!(queries, b"\x1b[c");
+    }
+
+    #[test]
+    fn forwards_query_split_across_chunks() {
+        let mut forwarder = TerminalQueryForwarder::default();
+        let first = forwarder.extract_queries(b"\x1b[");
+        assert!(first.is_empty());
+        let second = forwarder.extract_queries(b"0c");
+        assert_eq!(second, b"\x1b[0c");
+    }
+
+    #[test]
+    fn does_not_forward_non_query_csi_sequences() {
+        let mut forwarder = TerminalQueryForwarder::default();
+        let queries = forwarder.extract_queries(b"\x1b[31mhello\x1b[0m");
+        assert!(queries.is_empty());
+    }
 }
