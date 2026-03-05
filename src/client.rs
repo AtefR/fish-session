@@ -170,6 +170,8 @@ pub fn attach_session_with_replay(name: &str, replay: bool) -> Result<()> {
     let mut current = name.to_string();
     let mut should_clear_before_attach = true;
     let mut should_replay = replay;
+    let app_config = crate::config::AppConfig::load().unwrap_or_default();
+    let control_bindings = ControlKeyBindings::from_config(&app_config);
 
     loop {
         let (attach_cols, attach_rows) = attach_dimensions_for_status_line();
@@ -196,7 +198,13 @@ pub fn attach_session_with_replay(name: &str, replay: bool) -> Result<()> {
             );
         }
 
-        match bridge_io(stream, &current, should_clear_before_attach, !should_replay)? {
+        match bridge_io(
+            stream,
+            &current,
+            should_clear_before_attach,
+            !should_replay,
+            control_bindings,
+        )? {
             BridgeOutcome::Detached => return Ok(()),
             BridgeOutcome::SwitchRequested => {
                 if let Some(next) = crate::ui::pick_session_with_active(Some(&current))? {
@@ -302,6 +310,7 @@ fn bridge_io(
     session_name: &str,
     clear_screen_on_attach: bool,
     swallow_initial_enter: bool,
+    control_bindings: ControlKeyBindings,
 ) -> Result<BridgeOutcome> {
     let _guard = RawModeGuard::new()?;
     let _screen_restore_guard =
@@ -360,12 +369,12 @@ fn bridge_io(
                 continue;
             }
 
-            if let Some((pos, _, is_switch)) = find_control_key(&filtered) {
+            if let Some((pos, _, action)) = find_control_key(&filtered, control_bindings) {
                 if pos > 0 {
                     write_stream.write_all(&filtered[..pos])?;
                     write_stream.flush()?;
                 }
-                if is_switch {
+                if action == ControlAction::Switch {
                     switch_requested_for_input.store(true, Ordering::Relaxed);
                 }
                 let _ = write_stream.shutdown(Shutdown::Both);
@@ -467,25 +476,91 @@ fn parse_csi_u_enter(bytes: &[u8]) -> Option<usize> {
     Some(i + 1)
 }
 
-fn find_control_key(bytes: &[u8]) -> Option<(usize, usize, bool)> {
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte == 0x07 {
-            return Some((index, 1, true));
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ControlAction {
+    Switch,
+    Detach,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct ControlKey {
+    raw_byte: u8,
+    csi_primary: u32,
+    csi_shifted: Option<u32>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct ControlKeyBindings {
+    switch: ControlKey,
+    detach: ControlKey,
+}
+
+impl ControlKeyBindings {
+    fn from_config(config: &crate::config::AppConfig) -> Self {
+        Self {
+            switch: parse_control_key_binding(config.open_key_binding())
+                .unwrap_or(ControlKey::ctrl_letter(b'g')),
+            detach: parse_control_key_binding(config.detach_key_binding())
+                .unwrap_or(ControlKey::ctrl_right_bracket()),
         }
-        if *byte == 0x1d {
-            return Some((index, 1, false));
+    }
+}
+
+impl ControlKey {
+    fn ctrl_letter(lowercase: u8) -> Self {
+        Self {
+            raw_byte: lowercase.saturating_sub(b'a').saturating_add(1),
+            csi_primary: lowercase as u32,
+            csi_shifted: Some((lowercase as char).to_ascii_uppercase() as u32),
+        }
+    }
+
+    fn ctrl_right_bracket() -> Self {
+        Self {
+            raw_byte: 0x1d,
+            csi_primary: b']' as u32,
+            csi_shifted: None,
+        }
+    }
+}
+
+fn parse_control_key_binding(binding: &str) -> Option<ControlKey> {
+    let binding = binding.trim().to_ascii_lowercase();
+    if binding == "ctrl-]" {
+        return Some(ControlKey::ctrl_right_bracket());
+    }
+    let bytes = binding.as_bytes();
+    if bytes.len() == 6 && &bytes[..5] == b"ctrl-" && bytes[5].is_ascii_lowercase() {
+        return Some(ControlKey::ctrl_letter(bytes[5]));
+    }
+    None
+}
+
+fn find_control_key(
+    bytes: &[u8],
+    bindings: ControlKeyBindings,
+) -> Option<(usize, usize, ControlAction)> {
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == bindings.switch.raw_byte {
+            return Some((index, 1, ControlAction::Switch));
+        }
+        if *byte == bindings.detach.raw_byte {
+            return Some((index, 1, ControlAction::Detach));
         }
         if *byte == 0x1b
-            && let Some((len, is_switch)) = parse_csi_u_control(&bytes[index..])
+            && let Some((len, action)) = parse_csi_u_control(&bytes[index..], bindings)
         {
-            return Some((index, len, is_switch));
+            return Some((index, len, action));
         }
     }
 
     None
 }
 
-fn parse_csi_u_control(bytes: &[u8]) -> Option<(usize, bool)> {
+fn parse_csi_u_control(
+    bytes: &[u8],
+    bindings: ControlKeyBindings,
+) -> Option<(usize, ControlAction)> {
     if bytes.len() < 6 || bytes[0] != 0x1b || bytes[1] != b'[' {
         return None;
     }
@@ -523,13 +598,17 @@ fn parse_csi_u_control(bytes: &[u8]) -> Option<(usize, bool)> {
         return None;
     }
 
-    let is_switch = matches!(codepoint, 103 | 71);
-    let is_detach = codepoint == 93;
-    if !is_switch && !is_detach {
-        return None;
+    if control_codepoint_matches_binding(codepoint, bindings.switch) {
+        return Some((i + 1, ControlAction::Switch));
     }
+    if control_codepoint_matches_binding(codepoint, bindings.detach) {
+        return Some((i + 1, ControlAction::Detach));
+    }
+    None
+}
 
-    Some((i + 1, is_switch))
+fn control_codepoint_matches_binding(codepoint: u32, key: ControlKey) -> bool {
+    codepoint == key.csi_primary || key.csi_shifted == Some(codepoint)
 }
 
 struct SessionRenderer {
@@ -615,7 +694,6 @@ impl SessionRenderer {
         frame.extend_from_slice(&self.parser.screen().attributes_formatted());
         frame
     }
-
 }
 
 fn current_terminal_layout() -> (u16, u16, u16) {

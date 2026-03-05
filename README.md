@@ -11,6 +11,7 @@ UI-first session manager for Fish shell with persistent PTY sessions, fast reatt
 - Session status chip at the bottom-left while attached
 - Reattach with scrollback replay
 - Random unique session name suggestion in create mode (`Ctrl-N`)
+- Configurable open/detach shortcuts via `config.json`
 
 ## Installation
 
@@ -126,6 +127,10 @@ Example:
 
 ```json
 {
+  "keys": {
+    "open": "ctrl-g",
+    "detach": "ctrl-]"
+  },
   "zoxide": {
     "enabled": true,
     "auto_open": false,
@@ -136,6 +141,8 @@ Example:
 
 Fields:
 
+- `keys.open`: keybinding to open picker (`ctrl-[a-z]` or `ctrl-]`)
+- `keys.detach`: keybinding to detach while attached (`ctrl-[a-z]` or `ctrl-]`)
 - `zoxide.enabled`: enable/disable zoxide mode in picker
 - `zoxide.auto_open`: open picker in zoxide mode by default
 - `zoxide.limit`: max displayed zoxide results
