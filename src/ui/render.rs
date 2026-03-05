@@ -164,7 +164,11 @@ fn render_sessions(frame: &mut Frame<'_>, app: &App, content: Rect) {
         Mode::Create => (
             " New Session ",
             if app.input.is_empty() {
-                "Type new session name..."
+                if app.create_suggestion.is_empty() {
+                    "Type new session name..."
+                } else {
+                    app.create_suggestion.as_str()
+                }
             } else {
                 app.input.as_str()
             },

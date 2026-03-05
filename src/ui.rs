@@ -9,6 +9,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use names::Generator;
 use ratatui::Terminal;
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -73,6 +74,7 @@ struct App {
     zoxide_selected: usize,
     mode: Mode,
     input: String,
+    create_suggestion: String,
 }
 
 #[derive(Clone)]
@@ -117,7 +119,25 @@ impl App {
             zoxide_selected: 0,
             mode: Mode::Normal,
             input: String::new(),
+            create_suggestion: String::new(),
         }
+    }
+
+    fn enter_create_mode(&mut self) {
+        self.input.clear();
+        self.mode = Mode::Create;
+        self.create_suggestion = suggest_session_name(&self.sessions);
+    }
+
+    fn create_name(&self) -> Option<String> {
+        let typed = self.input.trim();
+        if !typed.is_empty() {
+            return Some(typed.to_string());
+        }
+        if self.create_suggestion.is_empty() {
+            return None;
+        }
+        Some(self.create_suggestion.clone())
     }
 
     fn refresh(&mut self) -> Result<()> {
@@ -585,6 +605,63 @@ fn sanitize_session_name(raw: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+fn suggest_session_name(sessions: &[SessionInfo]) -> String {
+    let max_space = names::ADJECTIVES.len().saturating_mul(names::NOUNS.len());
+    let max_attempts = max_space.saturating_mul(2).clamp(64, 50_000);
+    suggest_session_name_from_candidates(sessions, Generator::default(), max_attempts)
+}
+
+fn suggest_session_name_from_candidates<I>(
+    sessions: &[SessionInfo],
+    candidates: I,
+    max_attempts: usize,
+) -> String
+where
+    I: IntoIterator<Item = String>,
+{
+    let existing: HashSet<String> = sessions
+        .iter()
+        .map(|session| session.name.clone())
+        .collect();
+
+    if let Some(candidate) = pick_unique_candidate(&existing, candidates.into_iter(), max_attempts)
+    {
+        return candidate;
+    }
+
+    fallback_session_name(&existing)
+}
+
+fn pick_unique_candidate<I>(
+    existing: &HashSet<String>,
+    candidates: I,
+    max_attempts: usize,
+) -> Option<String>
+where
+    I: Iterator<Item = String>,
+{
+    for candidate in candidates.take(max_attempts) {
+        if !existing.contains(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn fallback_session_name(existing: &HashSet<String>) -> String {
+    if !existing.contains("session") {
+        return "session".to_string();
+    }
+    let mut n = 2usize;
+    loop {
+        let candidate = format!("session-{n}");
+        if !existing.contains(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 fn truncate_from_left(input: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -615,7 +692,7 @@ fn truncate_from_left(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         ZoxideEntry, fuzzy_filter, next_session_name, parse_scored_zoxide_line,
-        sanitize_session_name,
+        sanitize_session_name, suggest_session_name, suggest_session_name_from_candidates,
     };
     use crate::protocol::SessionInfo;
     use std::path::PathBuf;
@@ -672,5 +749,62 @@ mod tests {
             results.first().unwrap().path,
             PathBuf::from("/home/vincent/Code/codex")
         );
+    }
+
+    #[test]
+    fn suggested_name_skips_existing_candidates() {
+        let sessions = vec![SessionInfo {
+            name: "calm-cloud".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            pid: 1,
+            attached: false,
+        }];
+        let candidates = vec!["calm-cloud".to_string(), "vivid-river".to_string()];
+
+        let suggested = suggest_session_name_from_candidates(&sessions, candidates, 10);
+        assert_eq!(suggested, "vivid-river");
+    }
+
+    #[test]
+    fn suggested_name_falls_back_when_candidates_exhausted() {
+        let sessions = vec![
+            SessionInfo {
+                name: "taken".to_string(),
+                cwd: PathBuf::from("/tmp"),
+                pid: 1,
+                attached: false,
+            },
+            SessionInfo {
+                name: "session".to_string(),
+                cwd: PathBuf::from("/tmp"),
+                pid: 1,
+                attached: false,
+            },
+            SessionInfo {
+                name: "session-2".to_string(),
+                cwd: PathBuf::from("/tmp"),
+                pid: 1,
+                attached: false,
+            },
+        ];
+        let candidates = vec!["taken".to_string(), "taken".to_string()];
+
+        let suggested = suggest_session_name_from_candidates(&sessions, candidates, 2);
+        assert_eq!(suggested, "session-3");
+    }
+
+    #[test]
+    fn suggested_name_uses_names_crate_style_when_available() {
+        let sessions = vec![SessionInfo {
+            name: "alpha".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            pid: 1,
+            attached: false,
+        }];
+
+        let suggested = suggest_session_name(&sessions);
+        assert!(suggested.contains('-'));
+        assert!(!suggested.is_empty());
+        assert_ne!(suggested, "alpha");
     }
 }

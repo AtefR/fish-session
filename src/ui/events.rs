@@ -67,8 +67,7 @@ pub(super) fn run_event_loop(
                         }
                     }
                     KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.input.clear();
-                        app.mode = Mode::Create;
+                        app.enter_create_mode();
                     }
                     KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if let Some(name) = app.selected_visible_session_name()
@@ -90,16 +89,19 @@ pub(super) fn run_event_loop(
                     KeyCode::Esc => {
                         app.mode = Mode::Normal;
                         app.input.clear();
+                        app.create_suggestion.clear();
                     }
                     KeyCode::Enter => {
-                        let name = app.input.trim().to_string();
-                        if name.is_empty() {
+                        let Some(name) = app.create_name() else {
                             continue;
-                        }
+                        };
 
                         let cwd = env::var("PWD").ok().map(PathBuf::from);
                         if client::create_session(&name, cwd).is_ok() {
                             return Ok(UiAction::attach(name, false));
+                        } else if app.input.trim().is_empty() {
+                            let _ = app.refresh();
+                            app.create_suggestion = super::suggest_session_name(&app.sessions);
                         }
                     }
                     _ => {}

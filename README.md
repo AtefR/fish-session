@@ -10,6 +10,7 @@ UI-first session manager for Fish shell with persistent PTY sessions, fast reatt
 - Zoxide mode (`Ctrl-O`) for directory-based session create/attach
 - Session status chip at the bottom-left while attached
 - Reattach with scrollback replay
+- Random unique session name suggestion in create mode (`Ctrl-N`)
 
 ## Installation
 
@@ -87,7 +88,7 @@ If release assets are not available yet, use the AUR or Cargo installation path.
 ## Quick Start
 
 1. Open picker: `Ctrl-G`
-2. Create session: `Ctrl-N`, type name, `Enter`
+2. Create session: `Ctrl-N`, type name or press `Enter` to accept suggested name
 3. Attach selected session: `Enter`
 4. Detach active session: `Ctrl-]`
 
