@@ -67,7 +67,7 @@ fisher install AtefR/fish-session
 2) Download binaries from the latest release assets:
 
 ```bash
-VERSION=v0.1.2
+VERSION=v0.1.3
 curl -fL -o fish-session "https://github.com/AtefR/fish-session/releases/download/${VERSION}/fish-session"
 curl -fL -o fish-sessiond "https://github.com/AtefR/fish-session/releases/download/${VERSION}/fish-sessiond"
 install -Dm755 fish-session ~/.local/bin/fish-session
@@ -151,13 +151,31 @@ set -g fish_session_disable_default_bind 1
 
 If you see `fish_session: fish-session binary not found in PATH`:
 
-```fish
-fish_add_path ~/.cargo/bin
-```
-
-Then open a new shell and verify:
+1. Verify binaries are installed:
 
 ```fish
 command -v fish-session
 command -v fish-sessiond
 ```
+
+2. If not installed, use one install path:
+
+- Arch/AUR: `paru -S fish-session`
+- Homebrew/Linuxbrew: `brew install atefr/tap/fish-session`
+- Fisher + Cargo:
+
+```fish
+fisher install AtefR/fish-session
+```
+
+```bash
+cargo install --git https://github.com/AtefR/fish-session.git
+```
+
+3. If using Cargo install, add Cargo bin to Fish `PATH`:
+
+```fish
+fish_add_path ~/.cargo/bin
+```
+
+4. Open a new shell and run `Ctrl-G`.
