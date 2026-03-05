@@ -571,7 +571,7 @@ impl SessionRenderer {
     fn render(&mut self, output: &mut impl Write) -> Result<()> {
         self.refresh_layout_if_needed();
 
-        let frame = self.compose_frame();
+        let frame = self.compose_frame(true);
         let mut next = vt100::Parser::new(self.rows.max(1), self.cols.max(1), 0);
         next.process(&frame);
 
@@ -603,7 +603,7 @@ impl SessionRenderer {
         self.composed_screen = None;
     }
 
-    fn compose_frame(&self) -> Vec<u8> {
+    fn compose_frame(&self, include_status: bool) -> Vec<u8> {
         let mut frame = Vec::new();
 
         // Build a deterministic frame: clear, draw session viewport, draw status.
@@ -611,7 +611,7 @@ impl SessionRenderer {
         frame.extend_from_slice(b"\x1b[1;1H");
         frame.extend_from_slice(&self.parser.screen().contents_formatted());
 
-        if self.rows >= 2 {
+        if include_status && self.rows >= 2 {
             frame.extend_from_slice(format!("\x1b[{};1H\x1b[2K", self.rows).as_bytes());
             frame.extend_from_slice(b"\x1b[7m");
             let label = status_label(&self.session_name, self.cols);
@@ -625,7 +625,9 @@ impl SessionRenderer {
     }
 
     fn snapshot(&self) -> Vec<u8> {
-        self.compose_frame()
+        // Snapshot is rendered on the primary screen before opening picker.
+        // Do not include the status row there, or it can persist after detach.
+        self.compose_frame(false)
     }
 }
 
