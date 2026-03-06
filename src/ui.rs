@@ -33,22 +33,26 @@ pub fn pick_session() -> Result<Option<PickerSelection>> {
 pub fn pick_session_with_active(active_session: Option<&str>) -> Result<Option<PickerSelection>> {
     client::ensure_daemon()?;
 
-    let config = AppConfig::load().unwrap_or_default();
-    let mut app = App::new(config, active_session.map(str::to_string));
-    app.refresh()?;
-
-    if app.config.zoxide.enabled && app.config.zoxide.auto_open && app.enter_zoxide_mode().is_err()
-    {
-        app.mode = Mode::Normal;
-        app.input.clear();
-    }
-
     let mut terminal = setup_terminal()?;
-    let action = events::run_event_loop(&mut terminal, &mut app);
-    restore_terminal(&mut terminal)?;
+    let result = (|| -> Result<Option<PickerSelection>> {
+        let config = AppConfig::load().unwrap_or_default();
+        let mut app = App::new(config, active_session.map(str::to_string));
+        app.refresh()?;
 
-    let action = action?;
-    Ok(action.attach)
+        if app.config.zoxide.enabled
+            && app.config.zoxide.auto_open
+            && app.enter_zoxide_mode().is_err()
+        {
+            app.mode = Mode::Normal;
+            app.input.clear();
+        }
+
+        let action = events::run_event_loop(&mut terminal, &mut app)?;
+        Ok(action.attach)
+    })();
+
+    restore_terminal(&mut terminal)?;
+    result
 }
 
 #[derive(Clone)]

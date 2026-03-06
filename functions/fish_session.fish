@@ -20,4 +20,5 @@ function fish_session --description 'Open fish-session picker UI'
     end
 
     command fish-session
+    commandline -f repaint ^/dev/null
 end

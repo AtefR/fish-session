@@ -315,14 +315,6 @@ fn bridge_io(
     let _guard = RawModeGuard::new()?;
     let _screen_restore_guard =
         ScreenRestoreGuard::new(clear_screen_on_attach, swallow_initial_enter)?;
-    disable_alternate_scroll_if_needed()?;
-    let mut renderer = SessionRenderer::new(session_name)?;
-    // Paint initial empty frame/status immediately after entering alt-screen.
-    {
-        let stdout = io::stdout();
-        let mut output = stdout.lock();
-        renderer.render(&mut output)?;
-    }
     if swallow_initial_enter {
         // Only flush stdin on attach flows that may carry picker Enter.
         unsafe {
@@ -335,8 +327,6 @@ fn bridge_io(
     let shutdown_stream = read_stream.try_clone()?;
     let switch_requested = Arc::new(AtomicBool::new(false));
     let switch_requested_for_input = Arc::clone(&switch_requested);
-    let alt_passthrough_active = Arc::new(AtomicBool::new(false));
-    let alt_passthrough_active_for_input = Arc::clone(&alt_passthrough_active);
     let mut input_filter = TerminalReplyFilter::default();
     let swallow_initial_enter_for_input = swallow_initial_enter;
 
@@ -354,10 +344,7 @@ fn bridge_io(
                 break;
             }
 
-            let mut filtered = input_filter.filter(
-                &buf[..count],
-                alt_passthrough_active_for_input.load(Ordering::Relaxed),
-            );
+            let mut filtered = input_filter.filter(&buf[..count], true);
             if swallow_initial_enter {
                 if Instant::now() > swallow_deadline {
                     swallow_initial_enter = false;
@@ -398,7 +385,8 @@ fn bridge_io(
     let stdout = io::stdout();
     let mut output = stdout.lock();
     let mut buf = [0_u8; 4096];
-    let mut query_forwarder = TerminalQueryForwarder::default();
+    let mut output_filter = AlternateScrollOutputFilter::default();
+    draw_passthrough_status_chip(&mut output, session_name)?;
     loop {
         let count = match read_stream.read(&mut buf) {
             Ok(0) => break,
@@ -408,15 +396,12 @@ fn bridge_io(
             Err(err) => return Err(err.into()),
         };
 
-        if !renderer.is_alt_passthrough_active() {
-            let queries = query_forwarder.extract_queries(&buf[..count]);
-            if !queries.is_empty() {
-                output.write_all(&queries)?;
-                output.flush()?;
-            }
+        let filtered = output_filter.filter(&buf[..count]);
+        if !filtered.is_empty() {
+            output.write_all(&filtered)?;
+            output.flush()?;
         }
-        renderer.process_output(&buf[..count], &mut output)?;
-        alt_passthrough_active.store(renderer.is_alt_passthrough_active(), Ordering::Relaxed);
+        draw_passthrough_status_chip(&mut output, session_name)?;
     }
 
     match input_thread.join() {
@@ -450,7 +435,7 @@ fn strip_leading_enter_events(bytes: &mut Vec<u8>) {
 }
 
 fn parse_csi_u_enter(bytes: &[u8]) -> Option<usize> {
-    if bytes.len() < 6 || bytes[0] != 0x1b || bytes[1] != b'[' {
+    if bytes.len() < 5 || bytes[0] != 0x1b || bytes[1] != b'[' {
         return None;
     }
 
@@ -464,17 +449,21 @@ fn parse_csi_u_enter(bytes: &[u8]) -> Option<usize> {
             .saturating_add((bytes[i] - b'0') as u32);
         i += 1;
     }
-    if !saw_codepoint || i >= bytes.len() || bytes[i] != b';' {
+    if !saw_codepoint || i >= bytes.len() {
         return None;
     }
 
-    i += 1;
-    let mut saw_modifiers = false;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        saw_modifiers = true;
+    if bytes[i] == b';' {
         i += 1;
-    }
-    if !saw_modifiers || i >= bytes.len() || bytes[i] != b'u' {
+        let mut saw_modifiers = false;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            saw_modifiers = true;
+            i += 1;
+        }
+        if !saw_modifiers || i >= bytes.len() || bytes[i] != b'u' {
+            return None;
+        }
+    } else if bytes[i] != b'u' {
         return None;
     }
 
@@ -667,6 +656,9 @@ impl SessionRenderer {
 
                 if data[i + 1] == b'[' {
                     if let Some((end, params, final_byte)) = parse_csi_at(&data, i) {
+                        let rewritten_private =
+                            rewrite_runtime_private_mode_csi(params, final_byte);
+                        let sequence = rewritten_private.as_deref().unwrap_or(&data[i..end]);
                         if let Some(enter_alt) = parse_alt_screen_transition(params, final_byte) {
                             if enter_alt {
                                 self.alt_passthrough_active = true;
@@ -677,9 +669,31 @@ impl SessionRenderer {
                                 needs_render = true;
                                 alt_state_changed = true;
                             }
+                            if !sequence.is_empty() {
+                                if self.alt_passthrough_active {
+                                    output.write_all(sequence)?;
+                                    wrote_raw = true;
+                                } else {
+                                    primary_bytes.extend_from_slice(sequence);
+                                }
+                            }
                             i = end;
                             continue;
                         }
+
+                        if !sequence.is_empty() {
+                            if self.alt_passthrough_active {
+                                output.write_all(sequence)?;
+                                wrote_raw = true;
+                            } else {
+                                primary_bytes.extend_from_slice(sequence);
+                            }
+                            i = end;
+                            continue;
+                        }
+
+                        i = end;
+                        continue;
                     } else {
                         self.mode_carry.extend_from_slice(&data[i..]);
                         break;
@@ -821,6 +835,48 @@ fn parse_alt_screen_transition(params: &[u8], final_byte: u8) -> Option<bool> {
     Some(final_byte == b'h')
 }
 
+fn rewrite_runtime_private_mode_csi(params: &[u8], final_byte: u8) -> Option<Vec<u8>> {
+    if (final_byte != b'h' && final_byte != b'l') || !params.starts_with(b"?") {
+        return None;
+    }
+
+    let mut changed = false;
+    let mut kept_modes: Vec<&[u8]> = Vec::new();
+    for mode in params[1..].split(|byte| *byte == b';') {
+        if mode.is_empty() {
+            continue;
+        }
+        if is_alt_screen_mode(mode) {
+            changed = true;
+            continue;
+        }
+        kept_modes.push(mode);
+    }
+
+    if !changed {
+        return None;
+    }
+
+    if kept_modes.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"\x1b[?");
+    for (idx, mode) in kept_modes.iter().enumerate() {
+        if idx > 0 {
+            out.push(b';');
+        }
+        out.extend_from_slice(mode);
+    }
+    out.push(final_byte);
+    Some(out)
+}
+
+fn is_alt_screen_mode(mode: &[u8]) -> bool {
+    mode == b"47" || mode == b"1047" || mode == b"1049"
+}
+
 fn current_terminal_layout() -> (u16, u16, u16) {
     let (cols, rows) = terminal_size().unwrap_or((80, 24));
     let safe_cols = cols.max(1);
@@ -843,6 +899,106 @@ fn status_label(name: &str, cols: u16) -> String {
         label = label.chars().take(cols as usize).collect();
     }
     label
+}
+
+#[derive(Default)]
+struct AlternateScrollOutputFilter {
+    carry: Vec<u8>,
+}
+
+impl AlternateScrollOutputFilter {
+    fn filter(&mut self, chunk: &[u8]) -> Vec<u8> {
+        let mut data = Vec::with_capacity(self.carry.len() + chunk.len());
+        data.extend_from_slice(&self.carry);
+        data.extend_from_slice(chunk);
+        self.carry.clear();
+
+        let mut out = Vec::with_capacity(data.len());
+        let mut i = 0usize;
+        while i < data.len() {
+            if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'[' {
+                if let Some((end, params, final_byte)) = parse_csi_at(&data, i) {
+                    if let Some(rewritten) = self.rewrite_private_mode_csi(params, final_byte) {
+                        out.extend_from_slice(&rewritten);
+                    } else {
+                        out.extend_from_slice(&data[i..end]);
+                    }
+                    i = end;
+                    continue;
+                }
+                self.carry.extend_from_slice(&data[i..]);
+                break;
+            }
+
+            out.push(data[i]);
+            i += 1;
+        }
+
+        out
+    }
+
+    fn rewrite_private_mode_csi(&mut self, params: &[u8], final_byte: u8) -> Option<Vec<u8>> {
+        if (final_byte != b'h' && final_byte != b'l') || !params.starts_with(b"?") {
+            return None;
+        }
+
+        let mut changed = false;
+        let mut kept_modes: Vec<&[u8]> = Vec::new();
+        for mode in params[1..].split(|byte| *byte == b';') {
+            if mode.is_empty() {
+                continue;
+            }
+
+            match mode {
+                b"1007" => {
+                    // Never allow alternate scroll hijacking.
+                    changed = true;
+                }
+                _ => {
+                    kept_modes.push(mode);
+                }
+            }
+        }
+
+        if !changed {
+            return None;
+        }
+
+        if kept_modes.is_empty() {
+            return Some(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"\x1b[?");
+        for (idx, mode) in kept_modes.iter().enumerate() {
+            if idx > 0 {
+                out.push(b';');
+            }
+            out.extend_from_slice(mode);
+        }
+        out.push(final_byte);
+        Some(out)
+    }
+}
+
+fn draw_passthrough_status_chip(output: &mut impl Write, session_name: &str) -> Result<()> {
+    let (cols, rows) = terminal_size().unwrap_or((80, 24));
+    if rows < 2 || cols == 0 {
+        return Ok(());
+    }
+
+    // Reserve bottom row as a non-scrolling status line.
+    write!(output, "\x1b[s\x1b[1;{}r", rows - 1)?;
+
+    let label = status_label(session_name, cols);
+
+    write!(
+        output,
+        "\x1b[{};1H\x1b[2K\x1b[7m{}\x1b[m\x1b[u",
+        rows, label
+    )?;
+    output.flush()?;
+    Ok(())
 }
 
 #[derive(Default)]
@@ -1065,17 +1221,11 @@ impl Drop for RawModeGuard {
 struct ScreenRestoreGuard {}
 
 impl ScreenRestoreGuard {
-    fn new(clear_screen_on_attach: bool, force_reset_alt_screen: bool) -> Result<Self> {
+    fn new(clear_screen_on_attach: bool, _force_reset_alt_screen: bool) -> Result<Self> {
         let mut output = io::stdout().lock();
+        write!(output, "\x1b[?1049h")?;
         if clear_screen_on_attach {
-            if force_reset_alt_screen {
-                // New session auto-attach should start from a pristine screen.
-                write!(output, "\x1b[?1049l\x1b[?1049h\x1b[2J\x1b[H")?;
-            } else {
-                write!(output, "\x1b[?1049h\x1b[2J\x1b[H")?;
-            }
-        } else {
-            write!(output, "\x1b[?1049h")?;
+            write!(output, "\x1b[2J\x1b[H")?;
         }
         output.flush()?;
         Ok(Self {})
@@ -1085,23 +1235,17 @@ impl ScreenRestoreGuard {
 impl Drop for ScreenRestoreGuard {
     fn drop(&mut self) {
         let mut output = io::stdout().lock();
-        let _ = write!(output, "\x1b[?1049l");
+        let _ = write!(output, "\x1b[r\x1b[?1049l");
         let _ = output.flush();
     }
 }
 
-fn disable_alternate_scroll_if_needed() -> Result<()> {
-    // Some terminals map wheel/trackpad scroll to Up/Down in alternate
-    // screen; disable alternate scroll while attached.
-    let mut output = io::stdout().lock();
-    write!(output, "\x1b[?1007l")?;
-    output.flush()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::TerminalQueryForwarder;
+    use super::{
+        AlternateScrollOutputFilter, TerminalQueryForwarder, parse_csi_u_enter,
+        rewrite_runtime_private_mode_csi,
+    };
 
     #[test]
     fn forwards_primary_da_query() {
@@ -1125,5 +1269,44 @@ mod tests {
         let mut forwarder = TerminalQueryForwarder::default();
         let queries = forwarder.extract_queries(b"\x1b[31mhello\x1b[0m");
         assert!(queries.is_empty());
+    }
+
+    #[test]
+    fn runtime_rewrite_keeps_alt_scroll_enable() {
+        let rewritten = rewrite_runtime_private_mode_csi(b"?1007", b'h');
+        assert_eq!(rewritten, None);
+    }
+
+    #[test]
+    fn runtime_rewrite_drops_alt_screen_but_preserves_other_private_modes() {
+        let rewritten = rewrite_runtime_private_mode_csi(b"?1007;25", b'h');
+        assert_eq!(rewritten, None);
+        let rewritten = rewrite_runtime_private_mode_csi(b"?1049;25", b'h');
+        assert_eq!(rewritten, Some(b"\x1b[?25h".to_vec()));
+    }
+
+    #[test]
+    fn parse_csi_u_enter_supports_without_modifiers() {
+        assert_eq!(parse_csi_u_enter(b"\x1b[13u"), Some(5));
+    }
+
+    #[test]
+    fn passthrough_filter_drops_1007_and_keeps_other_private_modes() {
+        let mut filter = AlternateScrollOutputFilter::default();
+
+        let out = filter.filter(b"\x1b[?1007h");
+        assert!(out.is_empty());
+
+        let out = filter.filter(b"\x1b[?1049;25h");
+        assert_eq!(out, b"\x1b[?1049;25h");
+    }
+
+    #[test]
+    fn alt_scroll_filter_handles_split_csi_chunks() {
+        let mut filter = AlternateScrollOutputFilter::default();
+        let first = filter.filter(b"\x1b[?1007");
+        assert_eq!(first, b"");
+        let second = filter.filter(b"hok");
+        assert_eq!(second, b"ok");
     }
 }
