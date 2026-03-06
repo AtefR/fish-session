@@ -2,6 +2,8 @@
 
 UI-first session manager for Fish shell with persistent PTY sessions, fast reattach, and an in-terminal picker.
 
+![fish-session usage demo](assets/usage.gif)
+
 ## Features
 
 - Persistent shell sessions via `fish-sessiond`
