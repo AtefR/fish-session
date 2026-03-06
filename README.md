@@ -71,7 +71,7 @@ fisher install AtefR/fish-session
 2) Download binaries from the latest release assets:
 
 ```bash
-VERSION=v0.1.6
+VERSION=v0.1.7
 curl -fL -o fish-session "https://github.com/AtefR/fish-session/releases/download/${VERSION}/fish-session"
 curl -fL -o fish-sessiond "https://github.com/AtefR/fish-session/releases/download/${VERSION}/fish-sessiond"
 install -Dm755 fish-session ~/.local/bin/fish-session

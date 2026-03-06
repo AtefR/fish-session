@@ -315,6 +315,7 @@ fn bridge_io(
     let _guard = RawModeGuard::new()?;
     let _screen_restore_guard =
         ScreenRestoreGuard::new(clear_screen_on_attach, swallow_initial_enter)?;
+    disable_alternate_scroll_if_needed()?;
     if swallow_initial_enter {
         // Only flush stdin on attach flows that may carry picker Enter.
         unsafe {
@@ -1238,6 +1239,15 @@ impl Drop for ScreenRestoreGuard {
         let _ = write!(output, "\x1b[r\x1b[?1049l");
         let _ = output.flush();
     }
+}
+
+fn disable_alternate_scroll_if_needed() -> Result<()> {
+    // In many terminals, alt-screen + alternate-scroll maps wheel/gesture
+    // events to Up/Down keypresses. Disable it explicitly for the attach view.
+    let mut output = io::stdout().lock();
+    write!(output, "\x1b[?1007l")?;
+    output.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]
