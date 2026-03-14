@@ -433,6 +433,31 @@ fn create_session_tracks_requested_cwd() {
     let _ = fs::remove_dir_all(cwd.parent().expect("cwd parent should exist"));
 }
 
+#[test]
+fn create_session_rejects_file_path_cwd() {
+    let daemon = TestDaemon::spawn();
+    let session_name = format!("file-cwd-{}", unique_id());
+    let temp_dir = unique_runtime_dir();
+    fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+    let file_path = temp_dir.join("not-a-directory");
+    fs::write(&file_path, b"file").expect("failed to create temp file");
+
+    let created = daemon
+        .request(Request::Create {
+            name: session_name,
+            cwd: Some(file_path.clone()),
+            terminal_env: None,
+        })
+        .expect("create request failed");
+    assert!(
+        !created.ok,
+        "file cwd unexpectedly succeeded: {:?}",
+        created.error
+    );
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
 fn unique_runtime_dir() -> PathBuf {
     env::temp_dir().join(format!("fish-session-it-{}", unique_id()))
 }

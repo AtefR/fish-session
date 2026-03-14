@@ -5,6 +5,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -36,8 +37,7 @@ pub fn ensure_daemon() -> Result<()> {
 
     let socket = socket_path();
     if let Some(parent) = socket.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create runtime dir {}", parent.display()))?;
+        ensure_private_runtime_dir(parent)?;
     }
 
     let stdin_null = OpenOptions::new().read(true).open("/dev/null")?;
@@ -162,14 +162,41 @@ pub fn rename_session(from: &str, to: &str) -> Result<()> {
     }
 }
 
+pub fn resize_session(name: &str, rows: u16, cols: u16) -> Result<()> {
+    let response = request(Request::Resize {
+        name: name.to_string(),
+        rows,
+        cols,
+    })?;
+    if response.ok {
+        Ok(())
+    } else {
+        bail!(
+            "resize failed: {}",
+            response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
+        )
+    }
+}
+
 pub fn attach_session(name: &str) -> Result<()> {
     attach_session_with_replay(name, true)
 }
 
 pub fn attach_session_with_replay(name: &str, replay: bool) -> Result<()> {
+    attach_session_with_options(name, replay, false)
+}
+
+pub fn attach_session_with_options(
+    name: &str,
+    replay: bool,
+    swallow_initial_enter: bool,
+) -> Result<()> {
     let mut current = name.to_string();
     let mut should_clear_before_attach = true;
     let mut should_replay = replay;
+    let mut should_swallow_initial_enter = swallow_initial_enter;
     let app_config = crate::config::AppConfig::load().unwrap_or_default();
     let control_bindings = ControlKeyBindings::from_config(&app_config);
 
@@ -202,7 +229,7 @@ pub fn attach_session_with_replay(name: &str, replay: bool) -> Result<()> {
             stream,
             &current,
             should_clear_before_attach,
-            !should_replay,
+            should_swallow_initial_enter,
             control_bindings,
         )? {
             BridgeOutcome::Detached => return Ok(()),
@@ -212,15 +239,18 @@ pub fn attach_session_with_replay(name: &str, replay: bool) -> Result<()> {
                         // Re-select current session: reconnect with replay to restore the surface.
                         should_replay = true;
                         should_clear_before_attach = true;
+                        should_swallow_initial_enter = next.swallow_initial_enter;
                         continue;
                     }
                     current = next.name;
                     should_replay = next.replay;
                     should_clear_before_attach = true;
+                    should_swallow_initial_enter = next.swallow_initial_enter;
                 } else {
                     // Esc closes picker: reconnect with replay to restore the surface.
                     should_replay = true;
                     should_clear_before_attach = true;
+                    should_swallow_initial_enter = false;
                     continue;
                 }
             }
@@ -254,6 +284,14 @@ fn request(req: Request) -> Result<Response> {
     let mut stream = connect_daemon().context("failed to connect to daemon")?;
     write_request(&mut stream, &req)?;
     read_response(&mut stream)
+}
+
+fn ensure_private_runtime_dir(path: &std::path::Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create runtime dir {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to secure runtime dir {}", path.display()))?;
+    Ok(())
 }
 
 fn write_request(stream: &mut UnixStream, req: &Request) -> Result<()> {
@@ -328,6 +366,9 @@ fn bridge_io(
     let shutdown_stream = read_stream.try_clone()?;
     let switch_requested = Arc::new(AtomicBool::new(false));
     let switch_requested_for_input = Arc::clone(&switch_requested);
+    let resize_running = Arc::new(AtomicBool::new(true));
+    let resize_running_for_thread = Arc::clone(&resize_running);
+    let resize_session_name = session_name.to_string();
     let mut input_filter = TerminalReplyFilter::default();
     let swallow_initial_enter_for_input = swallow_initial_enter;
 
@@ -350,10 +391,23 @@ fn bridge_io(
                 if Instant::now() > swallow_deadline {
                     swallow_initial_enter = false;
                 } else if !filtered.is_empty() {
-                    strip_leading_enter_events(&mut filtered);
-                    if filtered.is_empty() {
+                    let leading_reply_len = leading_terminal_reply_prefix_len(&filtered);
+                    let mut remainder = filtered[leading_reply_len..].to_vec();
+                    let stripped_enter = strip_leading_enter_events(&mut remainder);
+
+                    if filtered[..leading_reply_len].len() > 0 {
+                        write_stream.write_all(&filtered[..leading_reply_len])?;
+                        write_stream.flush()?;
+                    }
+
+                    if remainder.is_empty() {
+                        if stripped_enter {
+                            swallow_initial_enter = false;
+                        }
                         continue;
                     }
+
+                    filtered = remainder;
                     swallow_initial_enter = false;
                 } else {
                     continue;
@@ -383,6 +437,24 @@ fn bridge_io(
         Ok(())
     });
 
+    let resize_thread = thread::spawn(move || {
+        let mut last_dimensions = attach_dimensions_for_status_line();
+        while resize_running_for_thread.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(150));
+
+            let next_dimensions = attach_dimensions_for_status_line();
+            if next_dimensions == last_dimensions {
+                continue;
+            }
+            last_dimensions = next_dimensions;
+
+            let (Some(cols), Some(rows)) = next_dimensions else {
+                continue;
+            };
+            let _ = resize_session(&resize_session_name, rows, cols);
+        }
+    });
+
     let stdout = io::stdout();
     let mut output = stdout.lock();
     let mut buf = [0_u8; 4096];
@@ -405,6 +477,9 @@ fn bridge_io(
         draw_passthrough_status_chip(&mut output, session_name)?;
     }
 
+    resize_running.store(false, Ordering::Relaxed);
+    let _ = resize_thread.join();
+
     match input_thread.join() {
         Ok(result) => result?,
         Err(_) => return Err(anyhow!("input forwarding thread panicked")),
@@ -417,21 +492,58 @@ fn bridge_io(
     }
 }
 
-fn strip_leading_enter_events(bytes: &mut Vec<u8>) {
+fn strip_leading_enter_events(bytes: &mut Vec<u8>) -> bool {
+    let mut stripped = false;
     loop {
         if bytes.starts_with(b"\r\n") {
             bytes.drain(0..2);
+            stripped = true;
             continue;
         }
         if bytes.starts_with(b"\r") || bytes.starts_with(b"\n") {
             bytes.drain(0..1);
+            stripped = true;
             continue;
         }
         if let Some(len) = parse_csi_u_enter(bytes) {
             bytes.drain(0..len);
+            stripped = true;
             continue;
         }
         break;
+    }
+
+    stripped
+}
+
+fn leading_terminal_reply_prefix_len(bytes: &[u8]) -> usize {
+    let mut offset = 0usize;
+
+    while offset < bytes.len() {
+        match terminal_reply_len(&bytes[offset..]) {
+            Some(len) => offset += len,
+            None => break,
+        }
+    }
+
+    offset
+}
+
+fn terminal_reply_len(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 2 || bytes[0] != 0x1b {
+        return None;
+    }
+
+    match bytes[1] {
+        b'[' => {
+            let (end, params, final_byte) = parse_csi_at(bytes, 0)?;
+            if is_terminal_reply_csi(params, final_byte) {
+                Some(end)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -1179,6 +1291,16 @@ impl TerminalReplyFilter {
     }
 }
 
+fn is_terminal_reply_csi(params: &[u8], final_byte: u8) -> bool {
+    match final_byte {
+        b'c' | b'n' | b'R' => true,
+        b't' => params
+            .split(|byte| *byte == b';')
+            .any(|code| matches!(code, b"1" | b"2" | b"3" | b"4" | b"8" | b"9")),
+        _ => false,
+    }
+}
+
 fn osc_end(data: &[u8], from: usize) -> Option<usize> {
     let mut i = from;
     while i < data.len() {
@@ -1253,8 +1375,8 @@ fn disable_alternate_scroll_if_needed() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AlternateScrollOutputFilter, TerminalQueryForwarder, parse_csi_u_enter,
-        rewrite_runtime_private_mode_csi,
+        AlternateScrollOutputFilter, TerminalQueryForwarder, leading_terminal_reply_prefix_len,
+        parse_csi_u_enter, rewrite_runtime_private_mode_csi, strip_leading_enter_events,
     };
 
     #[test]
@@ -1318,5 +1440,18 @@ mod tests {
         assert_eq!(first, b"");
         let second = filter.filter(b"hok");
         assert_eq!(second, b"ok");
+    }
+
+    #[test]
+    fn leading_terminal_reply_prefix_detects_primary_da_reply() {
+        assert_eq!(leading_terminal_reply_prefix_len(b"\x1b[?62;c\r"), 7);
+    }
+
+    #[test]
+    fn strip_leading_enter_events_preserves_non_enter_tail() {
+        let mut bytes = b"\rhello".to_vec();
+        let stripped = strip_leading_enter_events(&mut bytes);
+        assert!(stripped);
+        assert_eq!(bytes, b"hello");
     }
 }

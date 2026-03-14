@@ -48,7 +48,7 @@ pub(super) fn run_event_loop(
                     KeyCode::Down | KeyCode::Char('j') => app.move_session_down(),
                     KeyCode::Enter => {
                         if let Some(name) = app.selected_visible_session_name() {
-                            return Ok(UiAction::attach(name, true));
+                            return Ok(UiAction::attach(name, true, true));
                         }
                     }
                     KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -98,7 +98,7 @@ pub(super) fn run_event_loop(
 
                         let cwd = env::var("PWD").ok().map(PathBuf::from);
                         if client::create_session(&name, cwd).is_ok() {
-                            return Ok(UiAction::attach(name, false));
+                            return Ok(UiAction::attach(name, true, true));
                         } else if app.input.trim().is_empty() {
                             let _ = app.refresh();
                             app.create_suggestion = super::suggest_session_name(&app.sessions);
@@ -154,7 +154,7 @@ pub(super) fn run_event_loop(
                         if let Some(path) = app.selected_zoxide_path()
                             && let Ok((session_name, replay)) = ensure_session_for_directory(&path)
                         {
-                            return Ok(UiAction::attach(session_name, replay));
+                            return Ok(UiAction::attach(session_name, replay, true));
                         }
                     }
                     _ => {}

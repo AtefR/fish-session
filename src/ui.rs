@@ -20,7 +20,11 @@ use std::process::Command;
 
 pub fn run_ui() -> Result<()> {
     if let Some(selection) = pick_session_with_active(None)? {
-        client::attach_session_with_replay(&selection.name, selection.replay)?;
+        client::attach_session_with_options(
+            &selection.name,
+            selection.replay,
+            selection.swallow_initial_enter,
+        )?;
     }
 
     Ok(())
@@ -98,9 +102,13 @@ impl UiAction {
         Self { attach: None }
     }
 
-    fn attach(name: String, replay: bool) -> Self {
+    fn attach(name: String, replay: bool, swallow_initial_enter: bool) -> Self {
         Self {
-            attach: Some(PickerSelection { name, replay }),
+            attach: Some(PickerSelection {
+                name,
+                replay,
+                swallow_initial_enter,
+            }),
         }
     }
 }
@@ -109,6 +117,7 @@ impl UiAction {
 pub struct PickerSelection {
     pub name: String,
     pub replay: bool,
+    pub swallow_initial_enter: bool,
 }
 
 impl App {
@@ -539,7 +548,7 @@ fn ensure_session_for_directory(path: &Path) -> Result<(String, bool)> {
 
     let name = next_session_name(path, &sessions);
     client::create_session(&name, Some(path.to_path_buf()))?;
-    Ok((name, false))
+    Ok((name, true))
 }
 
 fn paths_equal(left: &Path, right: &Path) -> bool {

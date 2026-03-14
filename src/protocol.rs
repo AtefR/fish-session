@@ -43,6 +43,11 @@ pub enum Request {
         from: String,
         to: String,
     },
+    Resize {
+        name: String,
+        rows: u16,
+        cols: u16,
+    },
     Attach {
         name: String,
         rows: Option<u16>,

@@ -13,6 +13,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -68,8 +69,7 @@ pub fn run_daemon() -> Result<()> {
 
     let socket_path = socket_path();
     if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create runtime dir {}", parent.display()))?;
+        ensure_private_runtime_dir(parent)?;
     }
 
     if socket_path.exists() {
@@ -82,6 +82,7 @@ pub fn run_daemon() -> Result<()> {
 
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("failed to bind {}", socket_path.display()))?;
+    secure_socket_file(&socket_path)?;
 
     let state = Arc::new(Mutex::new(DaemonState::default()));
     for stream in listener.incoming() {
@@ -140,6 +141,10 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -> Resu
             let result = rename_session(state, &from, &to);
             write_response(&mut stream, &result_to_response(result))?;
         }
+        Request::Resize { name, rows, cols } => {
+            let result = resize_session(state, &name, rows, cols);
+            write_response(&mut stream, &result_to_response(result))?;
+        }
         Request::Attach {
             name,
             rows,
@@ -169,6 +174,9 @@ fn create_session(
 
     if !cwd.exists() {
         bail!("working directory does not exist: {}", cwd.display());
+    }
+    if !cwd.is_dir() {
+        bail!("working directory is not a directory: {}", cwd.display());
     }
 
     let shell = preferred_shell();
@@ -237,6 +245,17 @@ fn rename_session(state: Arc<Mutex<DaemonState>>, from: &str, to: &str) -> Resul
     lock.sessions.insert(to.to_string(), session);
 
     Ok(())
+}
+
+fn resize_session(state: Arc<Mutex<DaemonState>>, name: &str, rows: u16, cols: u16) -> Result<()> {
+    let mut lock = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+    reap_dead_sessions(&mut lock);
+
+    let session = lock
+        .sessions
+        .get(name)
+        .ok_or_else(|| anyhow!("session not found: {name}"))?;
+    set_winsize(session.master.as_raw_fd(), rows, cols)
 }
 
 fn attach_session(
@@ -823,6 +842,20 @@ fn result_to_response(result: Result<()>) -> Response {
         Ok(()) => Response::ok(),
         Err(err) => Response::err(format!("{err:#}")),
     }
+}
+
+fn ensure_private_runtime_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create runtime dir {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to secure runtime dir {}", path.display()))?;
+    Ok(())
+}
+
+fn secure_socket_file(path: &Path) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to secure daemon socket {}", path.display()))?;
+    Ok(())
 }
 
 fn dup_owned_fd(fd: i32) -> Result<OwnedFd> {
